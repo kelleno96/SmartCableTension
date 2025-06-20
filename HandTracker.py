@@ -34,6 +34,12 @@ class HandTracker:
         self.last_time = time.time()
         self.last_velocity = 0
         self.last_position = None
+        self.pid_integral = 0.0
+        self.pid_integral_for_velocity_control = 0
+        self.previous_velocity_error = 0.0
+        
+        self.torque_out = 0.0
+        
         
     def hand_tracking(self):
         cap = cv2.VideoCapture(0)
@@ -92,6 +98,54 @@ class HandTracker:
             return 50.0 * ratio
         
         return 50.0  # Constant torque in the middle range
+    
+    def calculate_torque_from_velocity(self, y_pos, velocity_in, velocity_desired):
+        # Increase or decrease torque such that velocity is close to desired velocity
+        with self.voice_lock:
+            if self.voice_pause:
+                return 0.0
+        
+        if self.low_position is None or self.high_position is None or y_pos is None:
+            return 0.0
+            
+        if y_pos > self.low_position:  # Remember, higher y means lower in image
+            return 0.0
+        if y_pos < self.high_position:  # Above high position
+            return 0.0
+            
+        # Calculate the transition zones
+        low_trans = self.low_position - self.PIXEL_BUFFER_SIZE
+        high_trans = self.high_position + self.PIXEL_BUFFER_SIZE
+        
+        if y_pos > low_trans:  # In the lower transition zone
+            ratio = (self.low_position - y_pos) / self.PIXEL_BUFFER_SIZE
+            return 50.0 * ratio
+        elif y_pos < high_trans:  # In the upper transition zone
+            ratio = (y_pos - self.high_position) / self.PIXEL_BUFFER_SIZE
+            return 50.0 * ratio
+        
+        velocity_error = velocity_in - velocity_desired
+        
+        velocity_sign_changed = False
+        if velocity_error >= 0 and self.previous_velocity_error < 0:
+            velocity_sign_changed = True
+        elif velocity_error <= 0 and self.previous_velocity_error > 0:
+            velocity_sign_changed = True
+        
+        # No integrator windup!
+        if velocity_sign_changed:
+            self.pid_integral_for_velocity_control = 0
+        
+        self.pid_integral_for_velocity_control += velocity_error
+        self.previous_velocity_error = velocity_error
+        
+        kp_velocity_control = 0.005
+        ki_velocity_control = 0.001
+        
+        base_torque = 50.0
+        self.torque_out = max(base_torque + kp_velocity_control * velocity_error + ki_velocity_control * self.pid_integral_for_velocity_control, base_torque)
+        return self.torque_out
+        
 
     def draw_plots(self):
         plot_height = 600  # Increased height to accommodate new graphs
@@ -224,15 +278,30 @@ class HandTracker:
                     # Update position and calculate derivatives
                     y_pos = hand[1]
                     alpha = 0.15
-                    y_pos = alpha * y_pos + (1 - alpha) * (self.position_history[-1] if self.position_history else y_pos)
-                    velocity, acceleration = self.calculate_derivatives(y_pos)
+                    kp = 0.3
+                    ki = 0.0
+                    kd = 0.0
+                    if self.last_position is not None:
+                        y_error = y_pos - self.last_position
+                    else:
+                        y_error = 0
+                    
+                    if self.last_position is None:
+                        self.last_position = y_pos
+                        
+                    output_y = self.last_position + kp * y_error + ki * self.pid_integral + kd * (y_error - self.last_velocity)
+                    self.pid_integral += y_error
+                    
+                    #y_pos = alpha * y_pos + (1 - alpha) * (self.position_history[-1] if self.position_history else y_pos)
+                    velocity, acceleration = self.calculate_derivatives(output_y)
                     
                     # Update histories
-                    self.position_history.append(y_pos)
+                    self.position_history.append(output_y)
                     self.velocity_history.append(velocity)
                     self.acceleration_history.append(acceleration)
                     
-                    torque = self.calculate_torque(y_pos)
+                    #torque = self.calculate_torque(output_y)
+                    torque = self.calculate_torque_from_velocity(output_y, velocity, 50)
                     self.torque_history.append(torque)
                     
                     # Display current values
@@ -283,7 +352,7 @@ class HandTracker:
         
         
         # Apply some smoothing
-        alpha = 0.15
+        alpha = 0.25
         velocity = alpha * velocity + (1-alpha) * self.last_velocity
         acceleration = alpha * acceleration + (1-alpha) * (self.acceleration_history[-1] if self.acceleration_history else 0)
         
