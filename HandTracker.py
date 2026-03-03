@@ -3,14 +3,14 @@ import mediapipe as mp
 import threading
 from collections import deque
 import numpy as np
-import speech_recognition as sr
 import time
+import serial
+
 
 class HandTracker:
     def __init__(self):
         # Thread synchronization
         self.data_lock = threading.Lock()
-        self.voice_lock = threading.Lock()
         self.stop_event = threading.Event()
         
         # Shared state between threads
@@ -20,7 +20,6 @@ class HandTracker:
         # Position and torque settings
         self.low_position = None
         self.high_position = None
-        self.voice_pause = False
         self.MAX_HISTORY = 640
         self.PIXEL_BUFFER_SIZE = 80
         
@@ -40,6 +39,26 @@ class HandTracker:
         
         self.torque_out = 0.0
         
+        # Serial port setup
+        self.serial_port = None
+        self.serial_enabled = False
+        try:
+            self.serial_port = serial.Serial(
+                '/dev/cu.usbserial-140', 
+                115200,
+                timeout=1,
+                exclusive=True  # Prevent other processes from using the port
+            )
+            time.sleep(2)  # Let Arduino reset
+            self.serial_enabled = True
+            print('Serial port opened successfully.')
+        except serial.SerialException as e:
+            print(f'Could not open serial port: {e}')
+            print('Try unplugging and replugging the USB device, or check: lsof | grep usbserial')
+            self.serial_enabled = False
+        except Exception as e:
+            print(f'Unexpected error opening serial port: {e}')
+            self.serial_enabled = False
         
     def hand_tracking(self):
         cap = cv2.VideoCapture(0)
@@ -74,10 +93,6 @@ class HandTracker:
         cap.release()
 
     def calculate_torque(self, y_pos):
-        with self.voice_lock:
-            if self.voice_pause:
-                return 0.0
-        
         if self.low_position is None or self.high_position is None or y_pos is None:
             return 0.0
             
@@ -101,10 +116,6 @@ class HandTracker:
     
     def calculate_torque_from_velocity(self, y_pos, velocity_in, velocity_desired):
         # Increase or decrease torque such that velocity is close to desired velocity
-        with self.voice_lock:
-            if self.voice_pause:
-                return 0.0
-        
         if self.low_position is None or self.high_position is None or y_pos is None:
             return 0.0
             
@@ -217,45 +228,6 @@ class HandTracker:
         
         return plot_img
 
-    def voice_listener(self):
-        recognizer = sr.Recognizer()
-        mic = sr.Microphone()
-        
-        with mic as source:
-            recognizer.adjust_for_ambient_noise(source)
-            print("Voice commands ready! Say 'stop', 'begin', 'set low position', or 'set high position'")
-            
-            while not self.stop_event.is_set():
-                try:
-                    audio = recognizer.listen(source, timeout=1, phrase_time_limit=3)
-                    try:
-                        command = recognizer.recognize_google(audio).lower()
-                        print(f"Heard: {command}")
-                        
-                        with self.voice_lock:
-                            if "stop" in command:
-                                self.voice_pause = True
-                                print("System paused")
-                            elif "begin" in command:
-                                self.voice_pause = False
-                                print("System resumed")
-                            elif "set low position" in command:
-                                with self.data_lock:
-                                    if self.current_hand:
-                                        self.low_position = self.current_hand[1]
-                                        print(f"Set low position to {self.low_position}")
-                            elif "set high position" in command:
-                                with self.data_lock:
-                                    if self.current_hand:
-                                        self.high_position = self.current_hand[1]
-                                        print(f"Set high position to {self.high_position}")
-                    except sr.UnknownValueError:
-                        pass  # Speech was unintelligible
-                    except sr.RequestError:
-                        print("Could not request results from speech recognition service")
-                except sr.WaitTimeoutError:
-                    continue  # No speech detected within timeout
-
     def display_and_print(self):
         cv2.namedWindow("Hand Tracking")
         cv2.namedWindow("Signals")
@@ -362,14 +334,44 @@ class HandTracker:
         self.last_velocity = velocity
         return velocity, acceleration
 
+    def serial_output_thread(self):
+        while not self.stop_event.is_set():
+            if self.serial_enabled and self.low_position is not None and self.high_position is not None:
+                with self.data_lock:
+                    hand = self.current_hand
+                if hand:
+                    y = hand[1]
+                    # Clamp y between low and high
+                    y_clamped = min(max(y, self.high_position), self.low_position)
+                    maxPower = 128
+                    # Map y to 128-255 (128=stop, >128=forward, <128=reverse)
+                    if self.low_position == self.high_position:
+                        byte_val = 128
+                    else:
+                        byte_val = int(128 - maxPower * (self.low_position - y_clamped) / (self.low_position - self.high_position))
+                        byte_val = max(0, min(255, byte_val))
+                    try:
+                        self.serial_port.write(bytes([byte_val]))
+                    except Exception as e:
+                        print(f'Serial write error: {e}')
+                else:
+                    # If no hand detected, send stop command
+                    try:
+                        self.serial_port.write(bytes([128]))  # Stop command
+                    except Exception as e:
+                        print(f'Serial write error: {e}')
+            time.sleep(0.05)  # 20 Hz update
+
     def run(self):
         hand_thread = threading.Thread(target=self.hand_tracking)
-        voice_thread = threading.Thread(target=self.voice_listener, daemon=True)
-        
+        serial_thread = threading.Thread(target=self.serial_output_thread, daemon=True)
         hand_thread.start()
-        voice_thread.start()
+        serial_thread.start()
         self.display_and_print()
         hand_thread.join()
+        # Optionally close serial port on exit
+        if self.serial_port:
+            self.serial_port.close()
 
 def main():
     tracker = HandTracker()

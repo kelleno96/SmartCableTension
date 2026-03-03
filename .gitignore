@@ -1,4 +1,7 @@
 .vscode/launch.json
+venv/
+__pycache__/
+logs/
 venv/pyvenv.cfg
 venv/bin/activate
 venv/bin/activate.csh

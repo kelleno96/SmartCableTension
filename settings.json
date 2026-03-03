@@ -1,0 +1,17 @@
+{
+  "hsv_h_low": 101,
+  "hsv_h_high": 124,
+  "hsv_s_low": 138,
+  "hsv_s_high": 255,
+  "hsv_v_low": 24,
+  "hsv_v_high": 142,
+  "center_x": 155,
+  "center_y": 109,
+  "mask_radius": 100,
+  "power_level": 3.8,
+  "target_speed": 30.0,
+  "max_offset": 50,
+  "pi_kp": 0.005,
+  "pi_ki": 0.0,
+  "velocity_alpha": 0.2
+}
