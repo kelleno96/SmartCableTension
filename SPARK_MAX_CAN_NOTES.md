@@ -29,30 +29,32 @@ The Arduino bridge sends both to cover all firmware versions.
 
 ## Control Commands (Host → SPARK MAX)
 
-All setpoint frames: 8 bytes, bytes 0–3 = float32 LE setpoint, bytes 4–7 = 0x00.
+All setpoint frames have identical payload structure: 8 bytes.
 
-### Control Command (firmware 26.x, verified from traffic)
+| Bytes | Content                                                   |
+|-------|-----------------------------------------------------------|
+| 0–3   | float32 LE setpoint                                       |
+| 4–5   | int16 LE arbitrary feedforward (0 = disabled)             |
+| 6     | bits [1:0] = PID slot (0–3); bits [7:2] = reserved        |
+| 7     | reserved                                                  |
 
-All modes use a **single API10 = `0x000`**. The SPARK MAX interprets the value according
-to its currently configured control mode (set via REV Hardware Client or parameter API).
+**Each control mode uses its own API ID** (spark-frames-2.1.0 spec confirmed):
 
-| Bytes | Content                                      |
-|-------|----------------------------------------------|
-| 0–3   | float32 LE setpoint                          |
-| 4–7   | 0x00 (AuxFF=0, pidSlot=0)                    |
+| Command | api10  | Setpoint units  | Notes                         |
+|---------|--------|-----------------|-------------------------------|
+| `VEL`   | `0x000`| RPM             | Closed-loop, needs PID slot 1 |
+| `DUTY`  | `0x002`| −1.0 .. 1.0     | Open-loop, no PID needed      |
+| `POS`   | `0x004`| rotations       | Closed-loop, needs PID slot 0 |
+| `VOLTS` | `0x005`| volts (±12)     | Closed-loop voltage           |
 
-CAN ID = `makeSparkIdApi10(0x000, deviceId)`
+CAN ID = `makeSparkIdApi10(api10, deviceId)`
 
-> **Confirmed empirically**: REV Hardware Client (firmware 26.x) sends api10=`0x000` for
-> all control modes. Old API IDs from the 24.x PDF (0x002/0x012/0x032/0x042) do NOT work.
-> The SPARK MAX echoes the active setpoint back in Status Frame 8 (api10=`0x2E8`).
+> **Previous incorrect assumption**: We sniffed Hardware Client traffic while only testing
+> velocity and mistakenly concluded all modes shared api10=`0x000`. This caused position
+> commands to be sent as velocity commands (e.g. POS 5.0 → 5 RPM with position PID gains),
+> producing oscillation. The spec (spark-frames-2.1.0) confirmed separate IDs per mode.
 
-| Mode to configure in HW Client | Setpoint units  |
-|-------------------------------|-----------------|
-| Duty Cycle                    | −1.0 .. 1.0     |
-| Velocity                      | RPM (or scaled) |
-| Position                      | rotations       |
-| Voltage                       | volts (±12)     |
+> **PID slots (this project)**: slot 0 = position gains, slot 1 = velocity gains.
 
 ### Heartbeat
 
@@ -85,17 +87,14 @@ Default periods: Status 0 = 10 ms, Status 1 = 20 ms, Status 2 = 20 ms, Status 3+
 | 4–5   | uint16 LE | Sticky faults bitmask             |
 | 6–7   | —         | Flags (invert, brake, follower)   |
 
-### Status 1 — Motor Telemetry
+### Status 1 — Faults & Warnings
 `api10 = 0x061` (shifted `0x2E1`)
 
-| Bytes | Type      | Content                     |
-|-------|-----------|-----------------------------|
-| 0–3   | float32 LE | Motor velocity (RPM)       |
-| 4     | uint8     | Temperature (°C)            |
-| 5–6   | —         | Motor voltage (encoded)     |
-| 7     | —         | Motor current (encoded)     |
+All 8 bytes are fault/warning bitfields (active faults, active warnings, sticky faults,
+sticky warnings, follower flag). **Not a telemetry frame.** Velocity/temp/voltage/current
+are NOT here — see Status 2 for velocity and Status 0 for applied output.
 
-> Note: observed all-zeros when motor is at rest. Velocity confirmed in Status 2.
+> We do not currently decode Status 1 in the bridge.
 
 ### Status 2 — Encoder Position & Velocity ✓ verified
 `api10 = 0x062` (shifted `0x2E2`)
@@ -147,13 +146,15 @@ Implemented in `Arduino/CAN_SparkMAX_Bridge/CAN_SparkMAX_Bridge.ino`.
 ### Commands (PC → Arduino)
 
 ```
-VOLTS <devId> <voltage>       Voltage open-loop, ±12 V
-VEL   <devId> <rpm>           Velocity closed-loop (PID must be set in flash)
-POS   <devId> <rotations>     Position closed-loop (PID must be set in flash)
-STOP  <devId>                 Equivalent to VOLTS <devId> 0
-HB    <devId> <0|1>           Enable/disable heartbeat
-RATE  <devId> <idx> <ms>      Set status frame period (idx 0–6)
+VEL   <devId> <rpm> [slot]       Velocity closed-loop, api10=0x000, default slot=1
+POS   <devId> <rotations> [slot] Position closed-loop, api10=0x004, default slot=0
+DUTY  <devId> <-1..1>            Duty cycle open-loop, api10=0x002
+VOLTS <devId> <voltage>          Voltage control ±12 V, api10=0x005
+STOP  <devId>                    Zero all control modes (0x000/0x002/0x004/0x005), all slots
+HB    <devId> <0|1>              Enable/disable heartbeat
+RATE  <devId> <idx> <ms>         Set status frame period (idx 0–6)
 TX    <id_hex> <dlc> <data_hex>  Raw CAN frame
+PING                             Responds PONG (tests serial link)
 ```
 
 ### Output (Arduino → PC)

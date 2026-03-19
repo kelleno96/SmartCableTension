@@ -9,22 +9,24 @@
  *   TX <id_hex> <dlc> <data_hex>
  *      Example: TX 0x2050281 8 0000000000000000
  *
+ *   VEL <device_id> <rpm> [slot]
+ *      Example: VEL 1 300.0
+ *      Velocity closed-loop (api10=0x000). Default slot=1.
+ *
+ *   POS <device_id> <rotations> [slot]
+ *      Example: POS 1 5.0
+ *      Position closed-loop (api10=0x004). Default slot=0.
+ *
+ *   DUTY <device_id> <-1.0..1.0>
+ *      Example: DUTY 1 0.3
+ *      Open-loop duty cycle (api10=0x002, no PID gains needed).
+ *
  *   VOLTS <device_id> <voltage>
  *      Example: VOLTS 1 -3.5
- *      Sends SPARK MAX voltage control command (ControlType::kVoltage)
- *
- *   VEL <device_id> <rpm>
- *      Example: VEL 1 300.0
- *      Sends SPARK MAX velocity closed-loop command (ControlType::kVelocity)
- *      Requires PID gains configured in SPARK MAX via REV Hardware Client first.
- *
- *   POS <device_id> <rotations>
- *      Example: POS 1 5.0
- *      Sends SPARK MAX position closed-loop command (ControlType::kPosition)
- *      Requires PID gains configured in SPARK MAX via REV Hardware Client first.
+ *      Voltage control (api10=0x005).
  *
  *   STOP <device_id>
- *      Equivalent to VOLTS <device_id> 0
+ *      Zeroes all control modes
  *
  *   HB <device_id> <0|1>
  *      Enable/disable automatic heartbeat (20 ms)
@@ -33,8 +35,8 @@
  *      Set SPARK MAX status frame period (idx 0..6)
  *      Status frames relevant to encoders:
  *        0: Applied output, faults
- *        1: Velocity (RPM), temperature, voltage, current
- *        2: Motor position (rotations, relative encoder)
+ *        1: Faults and warnings
+ *        2: Encoder velocity (RPM) + position (rotations)
  *        3: Analog sensor voltage/velocity/position
  *        4: Alternate encoder velocity/position
  *        5: Duty-cycle absolute encoder position + velocity  <-- use this for absolute
@@ -46,7 +48,7 @@
  * Decoded status frames (if DECODE is enabled):
  *   POS <device_id> <rotations>        (from Status 2, relative encoder)
  *   ABSPOS <device_id> <0..1>          (from Status 5, absolute encoder)
- *   VEL <device_id> <rpm>              (from Status 1)
+ *   VEL <device_id> <rpm>              (from Status 2)
  */
 
 #include <SPI.h>
@@ -109,7 +111,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(CAN_INT_PIN), canISR, FALLING);
 
   Serial.println(F("READY"));
-  Serial.println(F("CMDS: TX, VOLTS, VEL, POS, STOP, HB, RATE, PING"));
+  Serial.println(F("CMDS: TX, VEL, POS, DUTY, VOLTS, STOP, HB, RATE, PING"));
 }
 
 bool parseHexId(const char* token, uint32_t* out) {
@@ -204,7 +206,13 @@ void sendHeartbeat() {
   sendCanFrame(hbId, payload, 8);
 }
 
-void sendSetpoint(uint8_t deviceId, float value, uint8_t pidSlot, const __FlashStringHelper* label) {
+// api10 values (spark-frames-2.1.0 spec, firmware 26.x):
+//   0x000 = Velocity setpoint (RPM, closed-loop)
+//   0x002 = Duty-cycle setpoint (-1..1, open-loop)
+//   0x004 = Position setpoint (rotations, closed-loop)
+//   0x005 = Voltage setpoint (V)
+void sendSetpoint(uint8_t deviceId, float value, uint8_t pidSlot,
+                  uint16_t api10, const __FlashStringHelper* label) {
   uint8_t payload[8] = {0};
   union { float f; uint8_t b[4]; } u;
   u.f = value;
@@ -212,10 +220,9 @@ void sendSetpoint(uint8_t deviceId, float value, uint8_t pidSlot, const __FlashS
   payload[1] = u.b[1];
   payload[2] = u.b[2];
   payload[3] = u.b[3];
-  // payload[6] bits [1:0] = pidSlot (selects which PID gain set to use, 0-3)
+  // payload[6] bits [1:0] = pidSlot (spec: bitPosition 48, 2 bits)
   payload[6] = pidSlot & 0x03;
-  // API10=0x000: generic setpoint observed from REV Hardware Client (firmware 26.x).
-  uint32_t canId = makeSparkIdApi10(0x000, deviceId);
+  uint32_t canId = makeSparkIdApi10(api10, deviceId);
   bool ok = sendCanFrame(canId, payload, 8);
   Serial.print(F("ACK "));
   Serial.print(label);
@@ -230,7 +237,7 @@ void sendSetpoint(uint8_t deviceId, float value, uint8_t pidSlot, const __FlashS
 void sendVoltageCommand(uint8_t deviceId, float volts) {
   if (volts > 12.0f) volts = 12.0f;
   if (volts < -12.0f) volts = -12.0f;
-  sendSetpoint(deviceId, volts, 0, F("VOLTS"));
+  sendSetpoint(deviceId, volts, 0, 0x005, F("VOLTS"));
 }
 
 
@@ -355,7 +362,7 @@ void handleCommand(char* line) {
       return;
     }
     if (slotTok) parseUInt(slotTok, &slot16);
-    sendSetpoint((uint8_t)(dev16 & 0x3F), v, (uint8_t)(slot16 & 0x03), F("VEL"));
+    sendSetpoint((uint8_t)(dev16 & 0x3F), v, (uint8_t)(slot16 & 0x03), 0x000, F("VEL"));
     return;
   }
 
@@ -370,7 +377,22 @@ void handleCommand(char* line) {
       return;
     }
     if (slotTok) parseUInt(slotTok, &slot16);
-    sendSetpoint((uint8_t)(dev16 & 0x3F), v, (uint8_t)(slot16 & 0x03), F("POS"));
+    sendSetpoint((uint8_t)(dev16 & 0x3F), v, (uint8_t)(slot16 & 0x03), 0x004, F("POS"));
+    return;
+  }
+
+  if (strcmp(cmd, "DUTY") == 0) {
+    char* devTok = strtok(nullptr, " \t\r\n");
+    char* vTok   = strtok(nullptr, " \t\r\n");
+    uint16_t dev16 = 0;
+    float v = 0.0f;
+    if (!parseUInt(devTok, &dev16) || !parseFloatVal(vTok, &v)) {
+      Serial.println(F("ERR DUTY args"));
+      return;
+    }
+    if (v > 1.0f) v = 1.0f;
+    if (v < -1.0f) v = -1.0f;
+    sendSetpoint((uint8_t)(dev16 & 0x3F), v, 0, 0x002, F("DUTY"));
     return;
   }
 
@@ -381,9 +403,12 @@ void handleCommand(char* line) {
       Serial.println(F("ERR STOP args"));
       return;
     }
-    // Zero all slots so whichever is active gets stopped
+    // Zero all control modes and all PID slots
     uint8_t d = (uint8_t)(dev16 & 0x3F);
-    for (uint8_t s = 0; s < 4; s++) sendSetpoint(d, 0.0f, s, F("STOP"));
+    static const uint16_t stopApis[] = {0x000, 0x002, 0x004, 0x005};
+    for (uint8_t a = 0; a < 4; a++)
+      for (uint8_t s = 0; s < 4; s++)
+        sendSetpoint(d, 0.0f, s, stopApis[a], F("STOP"));
     return;
   }
 
@@ -532,8 +557,10 @@ void loop() {
     sendHeartbeat();
     if (heartbeatJustEnabled) {
       heartbeatJustEnabled = false;
-      // Zero the setpoint immediately so the motor doesn't resume a stale command.
-      sendSetpoint(heartbeatDeviceId, 0.0f, 0, F("STOP"));
+      // Zero all control modes so motor doesn't resume a stale command.
+      static const uint16_t stopApis[] = {0x000, 0x002, 0x004, 0x005};
+      for (uint8_t a = 0; a < 4; a++)
+        sendSetpoint(heartbeatDeviceId, 0.0f, 0, stopApis[a], F("STOP"));
     }
   }
 

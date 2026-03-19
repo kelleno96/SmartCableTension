@@ -113,6 +113,7 @@ class MotorGUI:
         nb = ttk.Notebook(self.root)
         nb.pack(fill="x", padx=6)
 
+        self._build_duty_tab(nb)
         self._build_voltage_tab(nb)
         self._build_velocity_tab(nb)
         self._build_position_tab(nb)
@@ -166,7 +167,7 @@ class MotorGUI:
         # Rate config row (collapsed by default)
         rate_frame = ttk.LabelFrame(self.root, text="Status Frame Rates (ms, 0=default)", padding=4)
         rate_frame.pack(fill="x", padx=6, pady=(0,6))
-        labels = ["S0", "S1\n(vel)", "S2\n(pos)", "S3\n(analog)", "S4\n(alt enc)", "S5\n(abs enc)", "S6\n(abs vel)"]
+        labels = ["S0", "S1\n(faults)", "S2\n(vel+pos)", "S3\n(analog)", "S4\n(alt enc)", "S5\n(abs enc)", "S6\n(abs vel)"]
         self.rate_vars = []
         for i, lbl in enumerate(labels):
             ttk.Label(rate_frame, text=lbl, justify="center").grid(row=0, column=i*2, padx=2)
@@ -178,6 +179,23 @@ class MotorGUI:
                 ttk.Separator(rate_frame, orient="vertical").grid(row=0, column=i*2+1, rowspan=2, sticky="ns", padx=2)
         ttk.Button(rate_frame, text="Apply Rates", command=self._send_rates).grid(
             row=0, column=len(labels)*2, rowspan=2, padx=8)
+
+    def _build_duty_tab(self, nb):
+        f = ttk.Frame(nb, padding=8)
+        nb.add(f, text="Duty Cycle")
+        ttk.Label(f, text="Duty (-1..1):").grid(row=0, column=0, sticky="w")
+        self.duty_var = tk.DoubleVar(value=0.0)
+        sl = ttk.Scale(f, from_=-1, to=1, orient="horizontal",
+                       variable=self.duty_var, length=260,
+                       command=lambda _: self._update_duty_entry())
+        sl.grid(row=0, column=1, padx=6)
+        self.duty_entry = ttk.Entry(f, width=8)
+        self.duty_entry.insert(0, "0.0")
+        self.duty_entry.grid(row=0, column=2)
+        self.duty_entry.bind("<Return>", lambda _: self._entry_to_slider(self.duty_entry, self.duty_var, -1, 1))
+        ttk.Button(f, text="Send", command=self._send_duty).grid(row=0, column=3, padx=6)
+        ttk.Label(f, text="(Open-loop, no PID gains needed)", foreground="gray").grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(4,0))
 
     def _build_voltage_tab(self, nb):
         f = ttk.Frame(nb, padding=8)
@@ -236,6 +254,10 @@ class MotorGUI:
             row=1, column=0, columnspan=6, sticky="w", pady=(4,0))
 
     # ── Slider / entry sync ───────────────────────────────────────────────────
+
+    def _update_duty_entry(self):
+        self.duty_entry.delete(0, "end")
+        self.duty_entry.insert(0, f"{self.duty_var.get():.3f}")
 
     def _update_volt_entry(self):
         self.volt_entry.delete(0, "end")
@@ -311,6 +333,10 @@ class MotorGUI:
             self._log(f">> {line}")
         except Exception as e:
             self._log(f"[GUI] Write error: {e}")
+
+    def _send_duty(self):
+        self._entry_to_slider(self.duty_entry, self.duty_var, -1, 1)
+        self._send(f"DUTY {self.dev_var.get()} {self.duty_var.get():.4f}")
 
     def _send_stop(self):
         self._send(f"STOP {self.dev_var.get()}")
