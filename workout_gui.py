@@ -1,584 +1,599 @@
 """
 Smart Cable Tension — Workout GUI
 
-Tkinter-based GUI that integrates:
-  - Live camera feed with orange tape detection overlay
-  - Real-time cumulative angle + motor power graph
-  - Workout mode buttons (Constant Speed, Rubber Band, Constant Weight)
-  - Calibration buttons (Set Min, Set Max)
-  - Power level +/- controls
-  - BIG emergency stop button
+Uses the CAN_SparkMAX_Bridge Arduino to read encoder position and send
+velocity commands directly, replacing the old camera-based angle tracker.
+
+Workflow:
+  1. Connect to the Arduino serial port.
+  2. Move cable to rest position → press Set Min.
+  3. Move cable to full extension → press Set Max.
+  4. Set workout velocity (RPM) and press Start.
+  5. Motor runs at that velocity; auto-stops when a limit is hit.
+  6. STOP button (or Space/Escape) stops immediately at any time.
 
 Run:  python3 workout_gui.py
 """
 
 import tkinter as tk
 from tkinter import ttk
-import cv2
-import numpy as np
-from PIL import Image, ImageTk
-import time
+import serial
+import serial.tools.list_ports
 import threading
-
-from camera import Camera
-from detector import OrangeDetector
-from angle_tracker import AngleTracker
-from motor_controller import MotorController
-from workout_controller import WorkoutController, WorkoutMode, CalibrationState
-from live_plotter import LivePlotter
-from logger import Logger
-from settings import load_settings, save_settings
-
-
-class WorkoutApp:
-    UPDATE_INTERVAL_MS = 16  # ~60fps GUI update target
-
-    def __init__(self):
-        # ---- Load saved settings ----
-        self.settings = load_settings()
-
-        # ---- Init modules ----
-        self.logger = Logger()
-        self.logger.log_event("Workout GUI starting")
-
-        self.cam = Camera(index=0, width=320, height=240, fps=60)
-        self.detector = OrangeDetector()
-        self.tracker = AngleTracker()
-        self.plotter = LivePlotter(width=640, height=250, max_points=600)
-
-        self.motor = MotorController(port='/dev/cu.usbserial-10', baudrate=115200)
-        self.motor.connect()
-
-        # Apply saved settings to detector
-        self.detector.hsv_lower[0] = self.settings['hsv_h_low']
-        self.detector.hsv_upper[0] = self.settings['hsv_h_high']
-        self.detector.hsv_lower[1] = self.settings['hsv_s_low']
-        self.detector.hsv_upper[1] = self.settings['hsv_s_high']
-        self.detector.hsv_lower[2] = self.settings['hsv_v_low']
-        self.detector.hsv_upper[2] = self.settings['hsv_v_high']
-        self.detector.center = (self.settings['center_x'], self.settings['center_y'])
-        self.detector.mask_radius = self.settings.get('mask_radius', 100)
-
-        max_off = self.settings.get('max_offset', 50)
-        self.workout = WorkoutController(self.motor, self.logger, max_offset=max_off)
-        self.workout.power_level = float(self.settings.get('power_level', 5.0))
-        self.workout.target_speed = float(self.settings.get('target_speed', 90.0))
-        self.workout.pi_kp = float(self.settings.get('pi_kp', 0.15))
-        self.workout.pi_ki = float(self.settings.get('pi_ki', 0.03))
-        self.workout._velocity_alpha = float(self.settings.get('velocity_alpha', 0.3))
-
-        # ---- State ----
-        self.running = True
-        self.current_angle = 0.0
-        self.last_update_time = time.time()
-        self.frame_count = 0
-        self.fps = 0
-        self.fps_timer = time.time()
-        self.log_frame_counter = 0
-
-        # ---- Build GUI ----
-        self.root = tk.Tk()
-        self.root.title("Smart Cable Tension — Workout")
-        self.root.configure(bg='#1e1e1e')
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        self._build_gui()
-
-        # ---- Start update loop ----
-        self.root.after(self.UPDATE_INTERVAL_MS, self.update_loop)
-
-    def _build_gui(self):
-        """Build the tkinter GUI layout."""
-        root = self.root
-
-        # ---- Style ----
-        style = ttk.Style()
-        style.theme_use('default')
-        style.configure('TFrame', background='#1e1e1e')
-        style.configure('TLabel', background='#1e1e1e', foreground='#33ff66',
-                        font=('Helvetica', 13))
-        style.configure('Header.TLabel', background='#1e1e1e', foreground='#55ff88',
-                        font=('Helvetica', 15, 'bold'))
-        style.configure('Status.TLabel', background='#2a2a2a', foreground='#00ff88',
-                        font=('Helvetica', 14, 'bold'))
-        style.configure('Info.TLabel', background='#1e1e1e', foreground='#00ff88',
-                        font=('Helvetica', 14, 'bold'))
-        style.configure('TButton', font=('Helvetica', 12))
-        style.configure('TScale', background='#1e1e1e')
-        style.configure('TLabelframe', background='#1e1e1e')
-        style.configure('TLabelframe.Label', background='#1e1e1e', foreground='#33ff66',
-                        font=('Helvetica', 12, 'bold'))
-
-        # ---- Top: Status bar ----
-        status_frame = ttk.Frame(root)
-        status_frame.pack(fill=tk.X, padx=5, pady=(5, 0))
-
-        self.status_label = ttk.Label(status_frame, text="Initializing...",
-                                       style='Status.TLabel', anchor='center')
-        self.status_label.pack(fill=tk.X, ipady=4)
-
-        # ---- Middle: Camera + Graph side by side ----
-        mid_frame = ttk.Frame(root)
-        mid_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        # Camera panel (left)
-        cam_frame = ttk.Frame(mid_frame)
-        cam_frame.pack(side=tk.LEFT, padx=(0, 3))
-
-        ttk.Label(cam_frame, text="Camera", style='Header.TLabel').pack()
-        self.cam_label = ttk.Label(cam_frame)
-        self.cam_label.pack()
-
-        # Graph panel (right)
-        graph_frame = ttk.Frame(mid_frame)
-        graph_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(3, 0))
-
-        ttk.Label(graph_frame, text="Angle / Motor Graph", style='Header.TLabel').pack()
-        self.graph_label = ttk.Label(graph_frame)
-        self.graph_label.pack()
-
-        # ---- Info row ----
-        info_frame = ttk.Frame(root)
-        info_frame.pack(fill=tk.X, padx=5, pady=(0, 3))
-
-        self.angle_var = tk.StringVar(value="Angle: --")
-        self.velocity_var = tk.StringVar(value="Vel: --")
-        self.motor_var = tk.StringVar(value="Motor: 0")
-        self.power_info_var = tk.StringVar(value=f"Power: {self.workout.power_level:.2f}")
-        self.fps_var = tk.StringVar(value="FPS: --")
-
-        for var in [self.angle_var, self.velocity_var, self.motor_var, self.power_info_var, self.fps_var]:
-            ttk.Label(info_frame, textvariable=var, style='Info.TLabel', width=16).pack(side=tk.LEFT, padx=5)
-
-        # ---- Bottom: Controls ----
-        ctrl_frame = ttk.Frame(root)
-        ctrl_frame.pack(fill=tk.X, padx=5, pady=(0, 5))
-
-        # Row 1: Calibration
-        cal_frame = ttk.LabelFrame(ctrl_frame, text="Calibration", padding=5)
-        cal_frame.pack(fill=tk.X, pady=(0, 3))
-
-        self.btn_set_min = tk.Button(cal_frame, text="Set Min (Rest Pos)",
-                                      command=self.on_set_min,
-                                      bg='#2196F3', fg='black', font=('Helvetica', 11),
-                                      width=18, height=1)
-        self.btn_set_min.pack(side=tk.LEFT, padx=3)
-
-        self.btn_set_max = tk.Button(cal_frame, text="Set Max (Extended)",
-                                      command=self.on_set_max,
-                                      bg='#FF9800', fg='black', font=('Helvetica', 11),
-                                      width=18, height=1)
-        self.btn_set_max.pack(side=tk.LEFT, padx=3)
-
-        self.btn_reset_angle = tk.Button(cal_frame, text="Reset Angle",
-                                         command=self.on_reset_angle,
-                                         bg='#607D8B', fg='black', font=('Helvetica', 11),
-                                         width=12, height=1)
-        self.btn_reset_angle.pack(side=tk.LEFT, padx=3)
-
-        # Row 2: Workout Modes
-        mode_frame = ttk.LabelFrame(ctrl_frame, text="Workout Mode", padding=5)
-        mode_frame.pack(fill=tk.X, pady=(0, 3))
-
-        modes = [
-            ("Idle (Off)", WorkoutMode.IDLE, '#607D8B', 'black'),
-            ("Constant Speed", WorkoutMode.CONSTANT_SPEED, '#4CAF50', 'black'),
-            ("Rubber Band", WorkoutMode.RUBBER_BAND, '#9C27B0', 'black'),
-            ("Constant Weight", WorkoutMode.CONSTANT_WEIGHT, '#FF5722', 'black'),
-        ]
-        self.mode_buttons = {}
-        for label, mode, color, fgcolor in modes:
-            btn = tk.Button(mode_frame, text=label,
-                           command=lambda m=mode: self.on_set_mode(m),
-                           bg=color, fg=fgcolor, font=('Helvetica', 11),
-                           width=15, height=1)
-            btn.pack(side=tk.LEFT, padx=3)
-            self.mode_buttons[mode] = btn
-
-        # Row 3: Power Slider + Target Speed + Retract + Stop
-        power_frame = ttk.Frame(ctrl_frame)
-        power_frame.pack(fill=tk.X, pady=(0, 0))
-
-        # Power slider  −15 … 0 … +15, resolution 0.02
-        power_left = ttk.LabelFrame(power_frame, text="Power Level", padding=5)
-        power_left.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-
-        self.power_var = tk.DoubleVar(value=self.workout.power_level)
-        self.power_slider = tk.Scale(
-            power_left, from_=-15, to=15, orient=tk.HORIZONTAL,
-            variable=self.power_var, resolution=0.02,
-            bg='#2a2a2a', fg='#00ff88', highlightthickness=0,
-            troughcolor='#444444', length=300,
-            font=('Helvetica', 12, 'bold'),
-            command=self._on_power_slider_change)
-        self.power_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-
-        # Target Speed (deg/sec) for constant speed mode
-        speed_left = ttk.LabelFrame(power_frame, text="Target Speed (°/s)", padding=5)
-        speed_left.pack(side=tk.LEFT, padx=(0, 5))
-
-        self.btn_speed_down = tk.Button(speed_left, text="−",
-                                         command=self.on_target_speed_down,
-                                         bg='#455A64', fg='black',
-                                         font=('Helvetica', 12, 'bold'),
-                                         width=3, height=1)
-        self.btn_speed_down.pack(side=tk.LEFT, padx=2)
-
-        init_speed = f"{self.workout.target_speed:.0f}"
-        self.speed_display = tk.Label(speed_left, text=init_speed,
-                                       bg='#1e1e1e', fg='#00ff88',
-                                       font=('Helvetica', 20, 'bold'), width=5)
-        self.speed_display.pack(side=tk.LEFT, padx=3)
-
-        self.btn_speed_up = tk.Button(speed_left, text="+",
-                                       command=self.on_target_speed_up,
-                                       bg='#455A64', fg='black',
-                                       font=('Helvetica', 12, 'bold'),
-                                       width=3, height=1)
-        self.btn_speed_up.pack(side=tk.LEFT, padx=2)
-
-        # Retract button
-        self.btn_retract = tk.Button(power_frame, text="Retract",
-                                      command=self.on_retract,
-                                      bg='#00897B', fg='black',
-                                      font=('Helvetica', 12, 'bold'),
-                                      width=8, height=2)
-        self.btn_retract.pack(side=tk.RIGHT, padx=3)
-
-        # BIG STOP BUTTON
-        self.btn_stop = tk.Button(power_frame, text="⬛  STOP  ⬛",
-                                   command=self.on_emergency_stop,
-                                   bg='#d32f2f', fg='black', activebackground='#f44336',
-                                   font=('Helvetica', 20, 'bold'),
-                                   width=14, height=2)
-        self.btn_stop.pack(side=tk.RIGHT, padx=3)
-
-        # ---- HSV / Center Tuning Panel ----
-        tuning_frame = ttk.LabelFrame(ctrl_frame, text="Detection Tuning (HSV + Center)", padding=5)
-        tuning_frame.pack(fill=tk.X, pady=(3, 0))
-
-        # HSV sliders — row 1: H, row 2: S, row 3: V, row 4: Center X/Y
-        slider_font = ('Helvetica', 11)
-        self.hsv_vars = {}
-        hsv_defs = [
-            ("H Low", 0, 180, self.detector.hsv_lower[0]),
-            ("H High", 0, 180, self.detector.hsv_upper[0]),
-            ("S Low", 0, 255, self.detector.hsv_lower[1]),
-            ("S High", 0, 255, self.detector.hsv_upper[1]),
-            ("V Low", 0, 255, self.detector.hsv_lower[2]),
-            ("V High", 0, 255, self.detector.hsv_upper[2]),
-        ]
-        row_frame_1 = ttk.Frame(tuning_frame)
-        row_frame_1.pack(fill=tk.X)
-        row_frame_2 = ttk.Frame(tuning_frame)
-        row_frame_2.pack(fill=tk.X)
-
-        for i, (name, lo, hi, default) in enumerate(hsv_defs):
-            parent = row_frame_1 if i < 3 else row_frame_2
-            f = ttk.Frame(parent)
-            f.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-            var = tk.IntVar(value=default)
-            self.hsv_vars[name] = var
-            tk.Label(f, text=name, bg='#1e1e1e', fg='#33ff66', font=slider_font,
-                     width=6, anchor='e').pack(side=tk.LEFT)
-            tk.Scale(f, from_=lo, to=hi, orient=tk.HORIZONTAL, variable=var,
-                     bg='#2a2a2a', fg='#33ff66', highlightthickness=0,
-                     troughcolor='#444444', length=120,
-                     command=lambda v, n=name: self._on_hsv_change(n, v)).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # Center X / Y
-        center_frame = ttk.Frame(tuning_frame)
-        center_frame.pack(fill=tk.X, pady=(3, 0))
-
-        cx, cy = self.detector.center
-        self.center_x_var = tk.IntVar(value=cx)
-        self.center_y_var = tk.IntVar(value=cy)
-
-        for label_text, var, hi in [("Center X", self.center_x_var, 320), ("Center Y", self.center_y_var, 240)]:
-            f = ttk.Frame(center_frame)
-            f.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-            tk.Label(f, text=label_text, bg='#1e1e1e', fg='#33ff66', font=slider_font,
-                     width=8, anchor='e').pack(side=tk.LEFT)
-            tk.Scale(f, from_=0, to=hi, orient=tk.HORIZONTAL, variable=var,
-                     bg='#2a2a2a', fg='#33ff66', highlightthickness=0,
-                     troughcolor='#444444', length=180,
-                     command=lambda v: self._on_center_change()).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # ---- PI Gains Tuning Panel ----
-        pi_frame = ttk.LabelFrame(ctrl_frame, text="Constant Speed PI Gains", padding=5)
-        pi_frame.pack(fill=tk.X, pady=(3, 0))
-
-        pi_row = ttk.Frame(pi_frame)
-        pi_row.pack(fill=tk.X)
-
-        # Kp slider: 0.00 – 1.00
-        f_kp = ttk.Frame(pi_row)
-        f_kp.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        tk.Label(f_kp, text="Kp", bg='#1e1e1e', fg='#33ff66', font=slider_font,
-                 width=4, anchor='e').pack(side=tk.LEFT)
-        self.kp_var = tk.DoubleVar(value=self.workout.pi_kp)
-        tk.Scale(f_kp, from_=0, to=1.0, orient=tk.HORIZONTAL,
-                 variable=self.kp_var, resolution=0.005,
-                 bg='#2a2a2a', fg='#33ff66', highlightthickness=0,
-                 troughcolor='#444444', length=200,
-                 command=lambda v: self._on_pi_change()).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # Ki slider: 0.00 – 0.50
-        f_ki = ttk.Frame(pi_row)
-        f_ki.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        tk.Label(f_ki, text="Ki", bg='#1e1e1e', fg='#33ff66', font=slider_font,
-                 width=4, anchor='e').pack(side=tk.LEFT)
-        self.ki_var = tk.DoubleVar(value=self.workout.pi_ki)
-        tk.Scale(f_ki, from_=0, to=0.5, orient=tk.HORIZONTAL,
-                 variable=self.ki_var, resolution=0.005,
-                 bg='#2a2a2a', fg='#33ff66', highlightthickness=0,
-                 troughcolor='#444444', length=200,
-                 command=lambda v: self._on_pi_change()).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # Velocity smoothing slider: 0.05 – 1.00
-        f_alpha = ttk.Frame(pi_row)
-        f_alpha.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        tk.Label(f_alpha, text="Vel α", bg='#1e1e1e', fg='#33ff66', font=slider_font,
-                 width=5, anchor='e').pack(side=tk.LEFT)
-        self.alpha_var = tk.DoubleVar(value=self.workout._velocity_alpha)
-        tk.Scale(f_alpha, from_=0.05, to=1.0, orient=tk.HORIZONTAL,
-                 variable=self.alpha_var, resolution=0.05,
-                 bg='#2a2a2a', fg='#33ff66', highlightthickness=0,
-                 troughcolor='#444444', length=200,
-                 command=lambda v: self._on_pi_change()).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # ---- Keyboard shortcuts ----
-        root.bind('<space>', lambda e: self.on_emergency_stop())
-        root.bind('<Escape>', lambda e: self.on_emergency_stop())
-        root.bind('q', lambda e: self.on_close())
-        root.bind('r', lambda e: self.on_reset_angle())
-        root.bind('m', lambda e: self.on_set_min())
-        root.bind('t', lambda e: self.on_set_max())
-        root.bind('<Up>', lambda e: self.on_power_up())
-        root.bind('<Down>', lambda e: self.on_power_down())
-        root.bind('<Right>', lambda e: self.on_target_speed_up())
-        root.bind('<Left>', lambda e: self.on_target_speed_down())
-        root.bind('1', lambda e: self.on_set_mode(WorkoutMode.IDLE))
-        root.bind('2', lambda e: self.on_set_mode(WorkoutMode.CONSTANT_SPEED))
-        root.bind('3', lambda e: self.on_set_mode(WorkoutMode.RUBBER_BAND))
-        root.bind('4', lambda e: self.on_set_mode(WorkoutMode.CONSTANT_WEIGHT))
-        root.bind('5', lambda e: self.on_retract())
-
-    # ---- Event handlers ----
-
-    def _on_hsv_change(self, name, value):
-        """Update detector HSV thresholds from sliders."""
-        mapping = {
-            "H Low": (0, 'lower'), "H High": (0, 'upper'),
-            "S Low": (1, 'lower'), "S High": (1, 'upper'),
-            "V Low": (2, 'lower'), "V High": (2, 'upper'),
-        }
-        idx, which = mapping[name]
-        if which == 'lower':
-            self.detector.hsv_lower[idx] = int(value)
-        else:
-            self.detector.hsv_upper[idx] = int(value)
-        self._save_settings()
-
-    def _on_center_change(self):
-        """Update detector center from sliders."""
-        self.detector.center = (self.center_x_var.get(), self.center_y_var.get())
-        self._save_settings()
-
-    def _on_pi_change(self):
-        """Update PI gains from sliders."""
-        self.workout.pi_kp = self.kp_var.get()
-        self.workout.pi_ki = self.ki_var.get()
-        self.workout._velocity_alpha = self.alpha_var.get()
-        self._save_settings()
-
-    def on_set_min(self):
-        self.tracker.reset()
-        self.plotter.reset()
-        self.current_angle = 0.0
-        msg = self.workout.set_min_position(0.0)
-        self.logger.log_event(f"User set min position: {msg}")
-
-    def on_set_max(self):
-        msg = self.workout.set_max_position(self.current_angle)
-        self.logger.log_event(f"User set max position: {msg}")
-
-    def on_reset_angle(self):
-        self.tracker.reset()
-        self.plotter.reset()
-        self.current_angle = 0.0
-        self.logger.log_event("Angle reset to zero")
-
-    def on_set_mode(self, mode):
-        msg = self.workout.set_mode(mode)
-        self.logger.log_event(f"Mode set: {msg}")
-        # Update button highlighting
-        for m, btn in self.mode_buttons.items():
-            if m == mode:
-                btn.config(relief=tk.SUNKEN, bd=3)
-            else:
-                btn.config(relief=tk.RAISED, bd=2)
-
-    def _on_power_slider_change(self, value):
-        """Update power level from slider."""
-        self.workout.power_level = float(value)
-        self._save_settings()
-
-    def on_power_up(self):
-        new = min(15.0, self.workout.power_level + 0.02)
-        self.workout.power_level = round(new, 2)
-        self.power_var.set(self.workout.power_level)
-        self._save_settings()
-
-    def on_power_down(self):
-        new = max(-15.0, self.workout.power_level - 0.02)
-        self.workout.power_level = round(new, 2)
-        self.power_var.set(self.workout.power_level)
-        self._save_settings()
-
-    def on_retract(self):
-        """Manually retract cable back to min position at power 20."""
-        msg = self.workout.start_manual_retract(power=20)
-        self.logger.log_event(f"Manual retract: {msg}")
-
-    def on_target_speed_up(self):
-        spd = self.workout.increase_target_speed()
-        self.speed_display.config(text=f"{spd:.0f}")
-        self._save_settings()
-
-    def on_target_speed_down(self):
-        spd = self.workout.decrease_target_speed()
-        self.speed_display.config(text=f"{spd:.0f}")
-        self._save_settings()
-
-    def on_emergency_stop(self):
-        self.workout.emergency_stop()
-        self.logger.log_safety("USER EMERGENCY STOP")
-
-    def on_close(self):
-        self._save_settings()
-        self.running = False
-        self.workout.emergency_stop()
-        self.motor.disconnect()
-        self.cam.release()
-        self.logger.close()
-        self.root.destroy()
-
-    def _save_settings(self):
-        """Gather current settings and persist to disk."""
-        cx, cy = self.detector.center
-        self.settings.update({
-            'hsv_h_low': int(self.detector.hsv_lower[0]),
-            'hsv_h_high': int(self.detector.hsv_upper[0]),
-            'hsv_s_low': int(self.detector.hsv_lower[1]),
-            'hsv_s_high': int(self.detector.hsv_upper[1]),
-            'hsv_v_low': int(self.detector.hsv_lower[2]),
-            'hsv_v_high': int(self.detector.hsv_upper[2]),
-            'center_x': cx,
-            'center_y': cy,
-            'mask_radius': self.detector.mask_radius,
-            'power_level': self.workout.power_level,
-            'target_speed': self.workout.target_speed,
-            'max_offset': self.workout.max_offset,
-            'pi_kp': self.workout.pi_kp,
-            'pi_ki': self.workout.pi_ki,
-            'velocity_alpha': self.workout._velocity_alpha,
-        })
-        save_settings(self.settings)
-
-    # ---- Main update loop ----
-
-    def update_loop(self):
-        if not self.running:
-            return
-
-        now = time.time()
-        dt = now - self.last_update_time
-        self.last_update_time = now
-
-        # ---- Capture frame ----
-        ret, frame = self.cam.read()
-        if ret:
-            # ---- Detect orange tape ----
-            result = self.detector.detect(frame)
-
-            # ---- Update angle ----
-            self.current_angle = self.tracker.update(result['angle_deg'])
-
-            # ---- Workout controller update ----
-            ctrl_info = self.workout.update(self.current_angle, dt)
-
-            # ---- Draw camera overlay ----
-            display = frame.copy()
-            self.detector.draw_overlay(display, result)
-
-            # Add angle + motor info to camera view with background boxes
-            motor_offset = round((self.motor.current_speed - self.motor.NEUTRAL) / self.motor.UNIT)
-            h_disp = display.shape[0]
-            cv2.rectangle(display, (0, h_disp - 42), (220, h_disp), (0, 0, 0), -1)
-            cv2.putText(display, f"Cumulative: {self.current_angle:.1f} deg",
-                        (6, h_disp - 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 220, 50), 2)
-            cv2.putText(display, f"Motor: {motor_offset:+d}",
-                        (6, h_disp - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 120, 30), 2)
-
-            # Scale camera image up 2x for readability in the GUI
-            display_big = cv2.resize(display, (display.shape[1] * 2, display.shape[0] * 2),
-                                     interpolation=cv2.INTER_NEAREST)
-
-            # Convert to tkinter image
-            display_rgb = cv2.cvtColor(display_big, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(display_rgb)
-            imgtk = ImageTk.PhotoImage(image=img)
-            self.cam_label.imgtk = imgtk
-            self.cam_label.configure(image=imgtk)
-
-            # ---- Update plotter ----
-            self.plotter.update(self.current_angle, motor_offset)
-            plot_img = self.plotter.render()
-            plot_rgb = cv2.cvtColor(plot_img, cv2.COLOR_BGR2RGB)
-            plot_pil = Image.fromarray(plot_rgb)
-            plot_tk = ImageTk.PhotoImage(image=plot_pil)
-            self.graph_label.imgtk = plot_tk
-            self.graph_label.configure(image=plot_tk)
-
-            # ---- Update info labels ----
-            self.angle_var.set(f"Angle: {self.current_angle:.1f}°")
-            vel = self.workout.angular_velocity
-            self.velocity_var.set(f"Vel: {vel:.0f}°/s")
-            self.motor_var.set(f"Motor: {motor_offset:+d}")
-            self.power_info_var.set(f"Power: {self.workout.power_level:.2f}")
-
-            # FPS
-            self.frame_count += 1
-            if now - self.fps_timer > 0.5:
-                self.fps = self.frame_count / (now - self.fps_timer)
-                self.frame_count = 0
-                self.fps_timer = now
-            self.fps_var.set(f"FPS: {self.fps:.0f}")
-
-            # ---- Status bar ----
-            self.status_label.config(text=self.workout.status_text)
-
-            # ---- Periodic logging ----
-            self.log_frame_counter += 1
-            if self.log_frame_counter % 30 == 0:  # Log every ~30 frames
-                raw = result['angle_deg'] if result['angle_deg'] is not None else 0
-                self.logger.log_angle(raw, self.current_angle)
-
-        # Schedule next update
-        self.root.after(self.UPDATE_INTERVAL_MS, self.update_loop)
+import queue
+import time
+import collections
+import datetime
+import os
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# ── Serial reader thread ──────────────────────────────────────────────────────
+
+class SerialReader(threading.Thread):
+    def __init__(self, ser, rx_queue):
+        super().__init__(daemon=True)
+        self.ser = ser
+        self.rx_queue = rx_queue
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
 
     def run(self):
-        """Start the GUI main loop."""
-        self.root.mainloop()
+        while not self._stop.is_set():
+            try:
+                line = self.ser.readline().decode("ascii", errors="replace").strip()
+                if line:
+                    self.rx_queue.put(line)
+            except Exception:
+                break
 
 
-def main():
-    app = WorkoutApp()
-    app.run()
+# ── Constants ─────────────────────────────────────────────────────────────────
 
+DEVICE_ID    = 1
+VEL_SLOT     = 1          # PID slot for velocity control
+POLL_MS      = 20         # GUI poll interval
+PLOT_WINDOW  = 30.0       # seconds of history in position plot
+MAX_LOG_LINES = 300
+LOG_FILE = os.path.join(os.path.dirname(__file__), "logs", "workout_session.log")
+
+BG       = '#1a1a1a'
+BG2      = '#252525'
+GREEN    = '#00e676'
+YELLOW   = '#ffea00'
+RED      = '#ff1744'
+BLUE     = '#2979ff'
+GRAY     = '#607d8b'
+FG       = '#e0e0e0'
+
+
+# ── Main app ──────────────────────────────────────────────────────────────────
+
+class WorkoutApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Smart Cable Tension — Workout")
+        self.root.configure(bg=BG)
+        self.root.resizable(True, True)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Serial state
+        self.ser    = None
+        self.reader = None
+        self.rx_queue = queue.Queue()
+
+        # Motor telemetry
+        self.pos     = 0.0   # rotations (relative, from Status 2)
+        self.vel_rpm = 0.0   # RPM (from Status 2)
+        self.abspos  = 0.0   # 0-1 per revolution (analog encoder, Status 3)
+        self.output  = 0.0   # applied output -1..1
+
+        # Calibration limits
+        self.pos_min  = None   # rotations at rest position
+        self.pos_max  = None   # rotations at full extension
+
+        # Workout state
+        self.running      = False   # motor currently commanded to run
+        self.target_rpm   = 0.0
+        self.stop_reason  = ""
+
+        # Plot data
+        self.t0       = None
+        maxpts        = 3000
+        self.t_pos    = collections.deque(maxlen=maxpts)
+        self.d_pos    = collections.deque(maxlen=maxpts)
+        self.t_vel    = collections.deque(maxlen=maxpts)
+        self.d_vel    = collections.deque(maxlen=maxpts)
+
+        # Logging
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        self._logfile = open(LOG_FILE, "a", buffering=1)
+        self._logfile.write(f"\n{'='*60}\n")
+        self._logfile.write(f"SESSION START  {datetime.datetime.now().isoformat()}\n")
+        self._logfile.write(f"{'='*60}\n")
+
+        self._build_ui()
+        self._refresh_ports()
+        self._poll()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        root = self.root
+
+        # ── Connection bar ────────────────────────────────────────────────────
+        conn = tk.Frame(root, bg=BG, pady=4)
+        conn.pack(fill="x", padx=8)
+
+        tk.Label(conn, text="Port:", bg=BG, fg=FG, font=("Helvetica", 11)).pack(side="left")
+        self.port_var = tk.StringVar()
+        self.port_cb = ttk.Combobox(conn, textvariable=self.port_var, width=18, state="readonly")
+        self.port_cb.pack(side="left", padx=4)
+        ttk.Button(conn, text="↺", width=2, command=self._refresh_ports).pack(side="left")
+        self.conn_btn = tk.Button(conn, text="Connect", command=self._toggle_connect,
+                                  bg=BLUE, fg="white", font=("Helvetica", 11, "bold"),
+                                  relief="flat", padx=10)
+        self.conn_btn.pack(side="left", padx=8)
+        self.conn_lbl = tk.Label(conn, text="Disconnected", bg=BG, fg=GRAY,
+                                  font=("Helvetica", 11))
+        self.conn_lbl.pack(side="left")
+
+        tk.Frame(root, bg='#333', height=1).pack(fill="x")
+
+        # ── Live readback bar ─────────────────────────────────────────────────
+        rb = tk.Frame(root, bg=BG2, pady=6)
+        rb.pack(fill="x", padx=0)
+
+        def _stat(parent, label):
+            f = tk.Frame(parent, bg=BG2)
+            f.pack(side="left", padx=18)
+            tk.Label(f, text=label, bg=BG2, fg=GRAY, font=("Helvetica", 10)).pack()
+            val = tk.Label(f, text="—", bg=BG2, fg=GREEN,
+                           font=("Helvetica", 22, "bold"), width=9, anchor="center")
+            val.pack()
+            return val
+
+        self.lbl_pos    = _stat(rb, "Position (rot)")
+        self.lbl_vel    = _stat(rb, "Velocity (RPM)")
+        self.lbl_abspos = _stat(rb, "Abs Pos (0-1)")
+        self.lbl_output = _stat(rb, "Output")
+
+        # ── Position limit bar ────────────────────────────────────────────────
+        lim = tk.Frame(root, bg=BG, pady=4)
+        lim.pack(fill="x", padx=8)
+
+        tk.Label(lim, text="Min:", bg=BG, fg=GRAY, font=("Helvetica", 11)).pack(side="left")
+        self.lbl_min = tk.Label(lim, text="not set", bg=BG, fg=YELLOW,
+                                 font=("Helvetica", 12, "bold"), width=10)
+        self.lbl_min.pack(side="left", padx=(2, 16))
+
+        tk.Label(lim, text="Max:", bg=BG, fg=GRAY, font=("Helvetica", 11)).pack(side="left")
+        self.lbl_max = tk.Label(lim, text="not set", bg=BG, fg=YELLOW,
+                                 font=("Helvetica", 12, "bold"), width=10)
+        self.lbl_max.pack(side="left", padx=(2, 16))
+
+        # Position fraction bar (visual)
+        self.pos_canvas = tk.Canvas(lim, height=20, bg='#333', highlightthickness=0)
+        self.pos_canvas.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.pos_canvas.bind("<Configure>", lambda _: self._update_pos_bar())
+
+        # ── Calibration buttons ───────────────────────────────────────────────
+        cal = tk.Frame(root, bg=BG, pady=4)
+        cal.pack(fill="x", padx=8)
+
+        btn_style = dict(font=("Helvetica", 12, "bold"), relief="flat",
+                         padx=12, pady=6, cursor="hand2")
+
+        tk.Button(cal, text="Set Min  (rest position)",
+                  command=self._set_min, bg='#1565c0', fg="white",
+                  **btn_style).pack(side="left", padx=(0, 6))
+
+        tk.Button(cal, text="Set Max  (full extension)",
+                  command=self._set_max, bg='#e65100', fg="white",
+                  **btn_style).pack(side="left", padx=(0, 6))
+
+        tk.Button(cal, text="Clear Limits",
+                  command=self._clear_limits, bg=GRAY, fg="white",
+                  **btn_style).pack(side="left")
+
+        # ── Velocity control ──────────────────────────────────────────────────
+        vel_frame = tk.Frame(root, bg=BG, pady=6)
+        vel_frame.pack(fill="x", padx=8)
+
+        tk.Label(vel_frame, text="Workout Velocity (RPM)", bg=BG, fg=FG,
+                 font=("Helvetica", 12, "bold")).pack(anchor="w")
+
+        slider_row = tk.Frame(vel_frame, bg=BG)
+        slider_row.pack(fill="x")
+
+        tk.Button(slider_row, text="−100", command=lambda: self._step_rpm(-100),
+                  bg=BG2, fg=FG, font=("Helvetica", 11), relief="flat",
+                  padx=8, pady=4).pack(side="left")
+        tk.Button(slider_row, text="−10", command=lambda: self._step_rpm(-10),
+                  bg=BG2, fg=FG, font=("Helvetica", 11), relief="flat",
+                  padx=8, pady=4).pack(side="left", padx=(2, 0))
+
+        self.rpm_var = tk.DoubleVar(value=0.0)
+        self.rpm_slider = tk.Scale(
+            slider_row, from_=-3000, to=3000, orient="horizontal",
+            variable=self.rpm_var, resolution=10,
+            bg=BG, fg=GREEN, troughcolor='#333', highlightthickness=0,
+            font=("Helvetica", 11, "bold"), length=400,
+            command=self._on_rpm_slider)
+        self.rpm_slider.pack(side="left", padx=6, fill="x", expand=True)
+
+        tk.Button(slider_row, text="+10", command=lambda: self._step_rpm(10),
+                  bg=BG2, fg=FG, font=("Helvetica", 11), relief="flat",
+                  padx=8, pady=4).pack(side="left", padx=(0, 2))
+        tk.Button(slider_row, text="+100", command=lambda: self._step_rpm(100),
+                  bg=BG2, fg=FG, font=("Helvetica", 11), relief="flat",
+                  padx=8, pady=4).pack(side="left")
+
+        entry_row = tk.Frame(vel_frame, bg=BG)
+        entry_row.pack(anchor="w", pady=(2, 0))
+        tk.Label(entry_row, text="RPM:", bg=BG, fg=GRAY,
+                 font=("Helvetica", 11)).pack(side="left")
+        self.rpm_entry = tk.Entry(entry_row, width=8, font=("Helvetica", 11),
+                                   bg=BG2, fg=GREEN, insertbackground=GREEN)
+        self.rpm_entry.insert(0, "0")
+        self.rpm_entry.pack(side="left", padx=4)
+        self.rpm_entry.bind("<Return>", self._on_rpm_entry)
+
+        tk.Button(entry_row, text="Start", command=self._cmd_start,
+                  bg='#2e7d32', fg="white", font=("Helvetica", 12, "bold"),
+                  relief="flat", padx=16, pady=4).pack(side="left", padx=(12, 0))
+
+        # ── Status bar ────────────────────────────────────────────────────────
+        self.status_var = tk.StringVar(value="Disconnected")
+        self.status_lbl = tk.Label(root, textvariable=self.status_var,
+                                    bg=BG2, fg=GREEN, font=("Helvetica", 13, "bold"),
+                                    anchor="center", pady=6)
+        self.status_lbl.pack(fill="x")
+
+        # ── STOP button ───────────────────────────────────────────────────────
+        self.stop_btn = tk.Button(root, text="⏹  STOP",
+                                   command=self._cmd_stop,
+                                   bg=RED, fg="white", activebackground='#ff6d00',
+                                   font=("Helvetica", 28, "bold"),
+                                   relief="flat", pady=14, cursor="hand2")
+        self.stop_btn.pack(fill="x", padx=8, pady=6)
+
+        # ── Live plot ─────────────────────────────────────────────────────────
+        plot_frame = tk.LabelFrame(root, text="Live Position & Velocity",
+                                    bg=BG, fg=GRAY, font=("Helvetica", 10))
+        plot_frame.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        fig = Figure(figsize=(8, 2.8), dpi=96, facecolor=BG, tight_layout=True)
+        self.ax_pos = fig.add_subplot(2, 1, 1, facecolor=BG2)
+        self.ax_vel = fig.add_subplot(2, 1, 2, facecolor=BG2)
+        for ax in (self.ax_pos, self.ax_vel):
+            ax.tick_params(colors=GRAY, labelsize=8)
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#444')
+        self.ax_pos.set_ylabel("Position (rot)", color=GRAY, fontsize=8)
+        self.ax_vel.set_ylabel("Velocity (RPM)", color=GRAY, fontsize=8)
+        self.ax_vel.set_xlabel("Time (s)", color=GRAY, fontsize=8)
+        self.line_pos, = self.ax_pos.plot([], [], color=GREEN, linewidth=1.5)
+        self.line_vel, = self.ax_vel.plot([], [], color=YELLOW, linewidth=1.5)
+        # Horizontal limit lines
+        self.hline_min = self.ax_pos.axhline(y=0, color=BLUE,  linestyle='--', linewidth=1, visible=False)
+        self.hline_max = self.ax_pos.axhline(y=0, color='#ff9100', linestyle='--', linewidth=1, visible=False)
+
+        self.canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+        self.canvas.get_tk_widget().configure(bg=BG)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # ── Serial log ────────────────────────────────────────────────────────
+        from tkinter import scrolledtext
+        log_frame = tk.LabelFrame(root, text="Log", bg=BG, fg=GRAY,
+                                   font=("Helvetica", 10))
+        log_frame.pack(fill="x", padx=8, pady=(0, 6))
+        self.log_widget = scrolledtext.ScrolledText(
+            log_frame, height=4, font=("Courier", 9),
+            bg='#111', fg='#888', state="disabled", wrap="none")
+        self.log_widget.pack(fill="both", expand=True)
+
+        # ── Keyboard shortcuts ────────────────────────────────────────────────
+        root.bind("<space>",  lambda _: self._cmd_stop())
+        root.bind("<Escape>", lambda _: self._cmd_stop())
+        root.bind("<Up>",     lambda _: self._step_rpm(10))
+        root.bind("<Down>",   lambda _: self._step_rpm(-10))
+        root.bind("m",        lambda _: self._set_min())
+        root.bind("x",        lambda _: self._set_max())
+
+    # ── Serial ────────────────────────────────────────────────────────────────
+
+    def _refresh_ports(self):
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port_cb["values"] = ports
+        if ports and not self.port_var.get():
+            self.port_var.set(ports[0])
+
+    def _toggle_connect(self):
+        if self.ser and self.ser.is_open:
+            self._disconnect()
+        else:
+            self._connect()
+
+    def _connect(self):
+        port = self.port_var.get()
+        if not port:
+            return
+        try:
+            self.ser = serial.Serial(port, 500000, timeout=0.1)
+            self.t0 = None
+            self.reader = SerialReader(self.ser, self.rx_queue)
+            self.reader.start()
+            self.conn_btn.config(text="Disconnect")
+            self.conn_lbl.config(text=f"Connected: {port}", fg=GREEN)
+            self._log(f"[Connected to {port}]")
+        except Exception as e:
+            self._log(f"[Connect error: {e}]")
+
+    def _disconnect(self):
+        self._cmd_stop()
+        if self.reader:
+            self.reader.stop()
+            self.reader = None
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+        self.conn_btn.config(text="Connect")
+        self.conn_lbl.config(text="Disconnected", fg=GRAY)
+        self._log("[Disconnected]")
+
+    def _send(self, cmd):
+        if not self.ser or not self.ser.is_open:
+            return
+        try:
+            self.ser.write((cmd + "\n").encode("ascii"))
+        except Exception as e:
+            self._log(f"[Write error: {e}]")
+
+    # ── Commands ──────────────────────────────────────────────────────────────
+
+    def _cmd_stop(self):
+        self.running = False
+        self._send(f"STOP {DEVICE_ID}")
+        self.status_var.set("STOPPED")
+        self.status_lbl.config(fg=RED)
+
+    def _cmd_start(self):
+        if not self.ser or not self.ser.is_open:
+            self._log("[Not connected]")
+            return
+        if self.pos_min is None or self.pos_max is None:
+            self.status_var.set("Set Min AND Max before starting")
+            self.status_lbl.config(fg=RED)
+            self._log("[Blocked: limits not set]")
+            return
+        rpm = self.rpm_var.get()
+        if rpm == 0.0:
+            self._cmd_stop()
+            return
+        self.target_rpm = rpm
+        self.running = True
+        self._send(f"VEL {DEVICE_ID} {rpm:.1f} {VEL_SLOT}")
+        self.status_var.set(f"Running  {rpm:+.0f} RPM")
+        self.status_lbl.config(fg=GREEN)
+        self._log(f"Start  {rpm:+.0f} RPM")
+
+    def _on_rpm_slider(self, _=None):
+        v = self.rpm_var.get()
+        self.rpm_entry.delete(0, "end")
+        self.rpm_entry.insert(0, f"{v:.0f}")
+
+    def _on_rpm_entry(self, _=None):
+        try:
+            v = float(self.rpm_entry.get())
+            v = max(-3000, min(3000, v))
+            self.rpm_var.set(v)
+        except ValueError:
+            pass
+
+    def _step_rpm(self, delta):
+        v = max(-3000, min(3000, self.rpm_var.get() + delta))
+        self.rpm_var.set(v)
+        self._on_rpm_slider()
+
+    # ── Calibration ───────────────────────────────────────────────────────────
+
+    def _set_min(self):
+        self.pos_min = self.pos
+        self.lbl_min.config(text=f"{self.pos_min:+.3f}")
+        self._update_limit_lines()
+        self._log(f"Min set: {self.pos_min:+.4f} rot")
+
+    def _set_max(self):
+        self.pos_max = self.pos
+        self.lbl_max.config(text=f"{self.pos_max:+.3f}")
+        self._update_limit_lines()
+        self._log(f"Max set: {self.pos_max:+.4f} rot")
+
+    def _clear_limits(self):
+        self.pos_min = None
+        self.pos_max = None
+        self.lbl_min.config(text="not set")
+        self.lbl_max.config(text="not set")
+        self.hline_min.set_visible(False)
+        self.hline_max.set_visible(False)
+        self._log("Limits cleared")
+
+    def _update_limit_lines(self):
+        if self.pos_min is not None:
+            self.hline_min.set_ydata([self.pos_min, self.pos_min])
+            self.hline_min.set_visible(True)
+        if self.pos_max is not None:
+            self.hline_max.set_ydata([self.pos_max, self.pos_max])
+            self.hline_max.set_visible(True)
+
+    def _update_pos_bar(self):
+        """Draw a horizontal position bar between min and max."""
+        c = self.pos_canvas
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 4:
+            return
+        c.delete("all")
+        c.create_rectangle(0, 0, w, h, fill='#333', outline='')
+        if self.pos_min is None or self.pos_max is None:
+            c.create_text(w // 2, h // 2, text="set min and max to calibrate",
+                          fill=GRAY, font=("Helvetica", 9))
+            return
+        span = self.pos_max - self.pos_min
+        if abs(span) < 1e-6:
+            return
+        frac = (self.pos - self.pos_min) / span
+        frac = max(0.0, min(1.0, frac))
+        # Background track
+        c.create_rectangle(2, 4, w - 2, h - 4, fill='#444', outline='')
+        # Fill
+        bar_color = GREEN if 0.05 <= frac <= 0.95 else RED
+        c.create_rectangle(2, 4, 2 + int((w - 4) * frac), h - 4,
+                            fill=bar_color, outline='')
+        # Min / max markers
+        c.create_line(2, 0, 2, h, fill=BLUE, width=2)
+        c.create_line(w - 2, 0, w - 2, h, fill='#ff9100', width=2)
+        c.create_text(w // 2, h // 2,
+                      text=f"{frac * 100:.0f}%  ({self.pos:+.3f} rot)",
+                      fill="white", font=("Helvetica", 9, "bold"))
+
+    # ── RX parsing ────────────────────────────────────────────────────────────
+
+    def _parse_rx(self, line):
+        now = time.monotonic()
+        if self.t0 is None:
+            self.t0 = now
+        t = now - self.t0
+
+        parts = line.split()
+        if len(parts) >= 3 and parts[0] == "POS":
+            try:
+                self.pos = float(parts[2])
+                self.t_pos.append(t)
+                self.d_pos.append(self.pos)
+                self.lbl_pos.config(text=f"{self.pos:+.3f}")
+                self._update_pos_bar()
+                self._check_limits()
+            except ValueError:
+                pass
+        elif len(parts) >= 3 and parts[0] == "VEL":
+            try:
+                self.vel_rpm = float(parts[2])
+                self.t_vel.append(t)
+                self.d_vel.append(self.vel_rpm)
+                self.lbl_vel.config(text=f"{self.vel_rpm:+.0f}")
+            except ValueError:
+                pass
+        elif len(parts) >= 3 and parts[0] == "ABSPOS":
+            try:
+                self.abspos = float(parts[2])
+                self.lbl_abspos.config(text=f"{self.abspos:.4f}")
+            except ValueError:
+                pass
+        elif len(parts) >= 3 and parts[0] == "OUTPUT":
+            try:
+                self.output = float(parts[2])
+                self.lbl_output.config(text=f"{self.output:+.3f}")
+            except ValueError:
+                pass
+
+    def _check_limits(self):
+        """Auto-stop if position is outside calibrated limits."""
+        if not self.running:
+            return
+        if self.pos_min is None or self.pos_max is None:
+            return
+        lo = min(self.pos_min, self.pos_max)
+        hi = max(self.pos_min, self.pos_max)
+        margin = abs(hi - lo) * 0.02  # 2% grace margin
+        if self.pos < lo - margin:
+            self._cmd_stop()
+            self.status_var.set("Stopped — hit MIN limit")
+            self._log("Auto-stop: hit MIN limit")
+        elif self.pos > hi + margin:
+            self._cmd_stop()
+            self.status_var.set("Stopped — hit MAX limit")
+            self._log("Auto-stop: hit MAX limit")
+
+    # ── Poll loop ─────────────────────────────────────────────────────────────
+
+    _plot_tick = 0
+
+    def _poll(self):
+        updated = False
+        for _ in range(300):
+            try:
+                line = self.rx_queue.get_nowait()
+                self._logfile.write(
+                    f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}  << {line}\n")
+                self._parse_rx(line)
+                updated = True
+            except queue.Empty:
+                break
+
+        self._plot_tick += 1
+        if updated and self._plot_tick >= 5:
+            self._plot_tick = 0
+            self._update_plot()
+
+        self.root.after(POLL_MS, self._poll)
+
+    def _update_plot(self):
+        now = time.monotonic()
+        t_cur = (now - self.t0) if self.t0 else 0
+        cutoff = t_cur - PLOT_WINDOW
+
+        def trim(ts, ds):
+            tl, dl = list(ts), list(ds)
+            i = next((j for j, v in enumerate(tl) if v >= cutoff), 0)
+            return tl[i:], dl[i:]
+
+        tp, dp = trim(self.t_pos, self.d_pos)
+        tv, dv = trim(self.t_vel, self.d_vel)
+
+        self.line_pos.set_data(tp, dp)
+        self.line_vel.set_data(tv, dv)
+
+        for ax in (self.ax_pos, self.ax_vel):
+            ax.set_xlim(max(0, t_cur - PLOT_WINDOW), max(PLOT_WINDOW, t_cur))
+            ax.relim()
+            ax.autoscale_view(scalex=False, scaley=True)
+
+        self.canvas.draw_idle()
+
+    # ── Log widget ────────────────────────────────────────────────────────────
+
+    def _log(self, text):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self._logfile.write(f"{ts}  {text}\n")
+        self.log_widget.config(state="normal")
+        self.log_widget.insert("end", f"{ts}  {text}\n")
+        lines = int(self.log_widget.index("end-1c").split(".")[0])
+        if lines > MAX_LOG_LINES:
+            self.log_widget.delete("1.0", f"{lines - MAX_LOG_LINES}.0")
+        self.log_widget.see("end")
+        self.log_widget.config(state="disabled")
+
+    # ── Close ─────────────────────────────────────────────────────────────────
+
+    def _on_close(self):
+        self._disconnect()
+        self._logfile.write(f"SESSION END    {datetime.datetime.now().isoformat()}\n")
+        self._logfile.close()
+        self.root.destroy()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = WorkoutApp(root)
+    root.mainloop()
