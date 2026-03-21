@@ -75,6 +75,8 @@ class MotorGUI:
         self.data_abs    = collections.deque(maxlen=maxpts)   # Status 5 (absolute)
         self.times_vel   = collections.deque(maxlen=maxpts)
         self.data_vel    = collections.deque(maxlen=maxpts)   # Status 1 (RPM)
+        self.times_cur   = collections.deque(maxlen=maxpts)
+        self.data_cur    = collections.deque(maxlen=maxpts)   # Status 0 (A)
 
         self._build_ui()
         self._refresh_ports()
@@ -115,6 +117,7 @@ class MotorGUI:
 
         self._build_duty_tab(nb)
         self._build_voltage_tab(nb)
+        self._build_current_tab(nb)
         self._build_velocity_tab(nb)
         self._build_position_tab(nb)
 
@@ -144,15 +147,19 @@ class MotorGUI:
         plot_frame = ttk.LabelFrame(self.root, text="Live Plot", padding=4)
         plot_frame.pack(fill="both", expand=True, padx=6, pady=(0,4))
 
-        fig = Figure(figsize=(7, 3), dpi=96, tight_layout=True)
-        self.ax_pos = fig.add_subplot(2, 1, 1)
-        self.ax_vel = fig.add_subplot(2, 1, 2)
+        fig = Figure(figsize=(7, 4), dpi=96, tight_layout=True)
+        self.ax_pos = fig.add_subplot(3, 1, 1)
+        self.ax_vel = fig.add_subplot(3, 1, 2)
+        self.ax_cur = fig.add_subplot(3, 1, 3)
         self.ax_pos.set_ylabel("Position (rot)")
         self.ax_vel.set_ylabel("Velocity (RPM)")
-        self.ax_vel.set_xlabel("Time (s)")
+        self.ax_cur.set_ylabel("Current (A)")
+        self.ax_cur.set_xlabel("Time (s)")
         self.line_pos,  = self.ax_pos.plot([], [], color="#2980b9",  label="relative")
         self.line_abs,  = self.ax_pos.plot([], [], color="#27ae60",  label="absolute", linestyle="--")
         self.line_vel,  = self.ax_vel.plot([], [], color="#e67e22")
+        self.line_cur,  = self.ax_cur.plot([], [], color="#e74c3c")
+        self.ax_cur.set_ylim(0, 50)
         self.ax_pos.legend(fontsize=7, loc="upper left")
         self.canvas = FigureCanvasTkAgg(fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -212,6 +219,23 @@ class MotorGUI:
         self.volt_entry.bind("<Return>", lambda _: self._entry_to_slider(self.volt_entry, self.volt_var, -12, 12))
         ttk.Button(f, text="Send", command=self._send_volts).grid(row=0, column=3, padx=6)
 
+    def _build_current_tab(self, nb):
+        f = ttk.Frame(nb, padding=8)
+        nb.add(f, text="Current")
+        ttk.Label(f, text="Amps:").grid(row=0, column=0, sticky="w")
+        self.amps_var = tk.DoubleVar(value=0.0)
+        sl = ttk.Scale(f, from_=-40, to=40, orient="horizontal",
+                       variable=self.amps_var, length=260,
+                       command=lambda _: self._update_amps_entry())
+        sl.grid(row=0, column=1, padx=6)
+        self.amps_entry = ttk.Entry(f, width=8)
+        self.amps_entry.insert(0, "0.0")
+        self.amps_entry.grid(row=0, column=2)
+        self.amps_entry.bind("<Return>", lambda _: self._entry_to_slider(self.amps_entry, self.amps_var, -40, 40))
+        ttk.Button(f, text="Send", command=self._send_amps).grid(row=0, column=3, padx=6)
+        ttk.Label(f, text="(Closed-loop current control)", foreground="gray").grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(4,0))
+
     def _build_velocity_tab(self, nb):
         f = ttk.Frame(nb, padding=8)
         nb.add(f, text="Velocity (closed-loop)")
@@ -254,6 +278,10 @@ class MotorGUI:
             row=1, column=0, columnspan=6, sticky="w", pady=(4,0))
 
     # ── Slider / entry sync ───────────────────────────────────────────────────
+
+    def _update_amps_entry(self):
+        self.amps_entry.delete(0, "end")
+        self.amps_entry.insert(0, f"{self.amps_var.get():.2f}")
 
     def _update_duty_entry(self):
         self.duty_entry.delete(0, "end")
@@ -334,6 +362,10 @@ class MotorGUI:
         except Exception as e:
             self._log(f"[GUI] Write error: {e}")
 
+    def _send_amps(self):
+        self._entry_to_slider(self.amps_entry, self.amps_var, -40, 40)
+        self._send(f"AMPS {self.dev_var.get()} {self.amps_var.get():.3f}")
+
     def _send_duty(self):
         self._entry_to_slider(self.duty_entry, self.duty_var, -1, 1)
         self._send(f"DUTY {self.dev_var.get()} {self.duty_var.get():.4f}")
@@ -411,6 +443,13 @@ class MotorGUI:
                 self.output_lbl.config(text=f"{val:.3f}")
             except ValueError:
                 pass
+        elif len(parts) >= 3 and parts[0] == "CURRENT":
+            try:
+                val = float(parts[2])
+                self.times_cur.append(t)
+                self.data_cur.append(val)
+            except ValueError:
+                pass
 
     # ── Poll loop ─────────────────────────────────────────────────────────────
 
@@ -450,15 +489,18 @@ class MotorGUI:
         tp, dp = trim(self.times_pos, self.data_pos)
         ta, da = trim(self.times_abs, self.data_abs)
         tv, dv = trim(self.times_vel, self.data_vel)
+        tc, dc = trim(self.times_cur, self.data_cur)
 
         self.line_pos.set_data(tp, dp)
         self.line_abs.set_data(ta, da)
         self.line_vel.set_data(tv, dv)
+        self.line_cur.set_data(tc, dc)
 
         for ax in (self.ax_pos, self.ax_vel):
             ax.set_xlim(max(0, t_cur - PLOT_WINDOW), max(PLOT_WINDOW, t_cur))
             ax.relim()
             ax.autoscale_view(scalex=False, scaley=True)
+        self.ax_cur.set_xlim(max(0, t_cur - PLOT_WINDOW), max(PLOT_WINDOW, t_cur))
 
         self.canvas.draw_idle()
 

@@ -25,6 +25,10 @@
  *      Example: VOLTS 1 -3.5
  *      Voltage control (api10=0x005).
  *
+ *   AMPS <device_id> <current_A>
+ *      Example: AMPS 1 2.5
+ *      Current control (api10=0x006).
+ *
  *   STOP <device_id>
  *      Zeroes all control modes
  *
@@ -111,7 +115,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(CAN_INT_PIN), canISR, FALLING);
 
   Serial.println(F("READY"));
-  Serial.println(F("CMDS: TX, VEL, POS, DUTY, VOLTS, STOP, HB, RATE, PING"));
+  Serial.println(F("CMDS: TX, VEL, POS, DUTY, VOLTS, AMPS, STOP, HB, RATE, PING"));
 }
 
 bool parseHexId(const char* token, uint32_t* out) {
@@ -211,6 +215,7 @@ void sendHeartbeat() {
 //   0x002 = Duty-cycle setpoint (-1..1, open-loop)
 //   0x004 = Position setpoint (rotations, closed-loop)
 //   0x005 = Voltage setpoint (V)
+//   0x006 = Current setpoint (A, closed-loop)
 void sendSetpoint(uint8_t deviceId, float value, uint8_t pidSlot,
                   uint16_t api10, const __FlashStringHelper* label) {
   uint8_t payload[8] = {0};
@@ -351,6 +356,19 @@ void handleCommand(char* line) {
     return;
   }
 
+  if (strcmp(cmd, "AMPS") == 0) {
+    char* devTok = strtok(nullptr, " \t\r\n");
+    char* vTok   = strtok(nullptr, " \t\r\n");
+    uint16_t dev16 = 0;
+    float v = 0.0f;
+    if (!parseUInt(devTok, &dev16) || !parseFloatVal(vTok, &v)) {
+      Serial.println(F("ERR AMPS args"));
+      return;
+    }
+    sendSetpoint((uint8_t)(dev16 & 0x3F), v, 0, 0x006, F("AMPS"));
+    return;
+  }
+
   if (strcmp(cmd, "VEL") == 0) {
     char* devTok  = strtok(nullptr, " \t\r\n");
     char* vTok    = strtok(nullptr, " \t\r\n");
@@ -405,8 +423,8 @@ void handleCommand(char* line) {
     }
     // Zero all control modes and all PID slots
     uint8_t d = (uint8_t)(dev16 & 0x3F);
-    static const uint16_t stopApis[] = {0x000, 0x002, 0x004, 0x005};
-    for (uint8_t a = 0; a < 4; a++)
+    static const uint16_t stopApis[] = {0x000, 0x002, 0x004, 0x005, 0x006};
+    for (uint8_t a = 0; a < 5; a++)
       for (uint8_t s = 0; s < 4; s++)
         sendSetpoint(d, 0.0f, s, stopApis[a], F("STOP"));
     return;
@@ -522,13 +540,19 @@ void readCanFrames() {
         Serial.print(devId);
         Serial.print(' ');
         Serial.println(u.f, 5);
-      } else if (unshifted == 0x060) {
-        // Status 0: applied output (int16, divide by 32767 for -1..1)
+      } else if (unshifted == 0x060 && len >= 5) {
+        // Status 0: applied output (int16 at bits 0-15), current (uint12 at bits 28-39)
         int16_t rawOut = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
         Serial.print(F("OUTPUT "));
         Serial.print(devId);
         Serial.print(' ');
         Serial.println((float)rawOut / 32767.0f, 4);
+        // Current: upper nibble of byte 3 = bits[31:28], byte 4 = bits[39:32]
+        uint16_t rawCur = ((uint16_t)(buf[3] >> 4) & 0x0F) | ((uint16_t)buf[4] << 4);
+        Serial.print(F("CURRENT "));
+        Serial.print(devId);
+        Serial.print(' ');
+        Serial.println((float)rawCur * 0.03663f, 2);
       }
     }
 #endif
@@ -558,8 +582,8 @@ void loop() {
     if (heartbeatJustEnabled) {
       heartbeatJustEnabled = false;
       // Zero all control modes so motor doesn't resume a stale command.
-      static const uint16_t stopApis[] = {0x000, 0x002, 0x004, 0x005};
-      for (uint8_t a = 0; a < 4; a++)
+      static const uint16_t stopApis[] = {0x000, 0x002, 0x004, 0x005, 0x006};
+      for (uint8_t a = 0; a < 5; a++)
         sendSetpoint(heartbeatDeviceId, 0.0f, 0, stopApis[a], F("STOP"));
     }
   }
